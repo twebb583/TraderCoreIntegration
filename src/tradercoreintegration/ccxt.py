@@ -209,7 +209,10 @@ class CCXTClient:
             base_code = self._coin_name_to_code.get(_normalize_key(slug_token), slug_token.upper())
 
         requested_quote = vs_currency.upper()
-        candidate_quotes = [requested_quote, "USDT", "USD", "USDC", "BUSD"]
+        if requested_quote in ("BTC", "ETH"):
+            candidate_quotes = [requested_quote]
+        else:
+            candidate_quotes = [requested_quote, "USDT", "USD", "USDC", "BUSD"]
 
         seen_quotes: set[str] = set()
         for quote in candidate_quotes:
