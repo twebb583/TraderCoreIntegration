@@ -41,6 +41,21 @@ class OHLCVPoint:
     volume: float | None = None
 
 
+@dataclass
+class ResolvedSpotMarket:
+    """Resolved spot market metadata for an exchange.
+
+    Used by the multi-exchange spot volume ingestion path to record the
+    actual quote currency CCXT routed to (which may differ from the requested
+    quote — e.g. requested USDT, exchange only quotes USD).
+    """
+
+    exchange_id: str
+    symbol: str
+    base: str
+    quote: str
+
+
 class CCXTMarketNotFoundError(ExchangeError):
     pass
 
@@ -162,6 +177,34 @@ class CCXTClient:
 
     def snapshot_exchange_usage(self) -> dict[str, int]:
         return {self._exchange_id: self._successful_requests}
+
+    def resolve_spot_market(
+        self,
+        coin_id: str,
+        vs_currency: str,
+        base_symbol: str | None = None,
+    ) -> ResolvedSpotMarket:
+        """Resolve the spot market for ``coin_id`` on this exchange.
+
+        Returns the resolved CCXT symbol along with the actual base/quote
+        codes from the exchange's market metadata. Raises
+        ``CCXTMarketNotFoundError`` (or ``BadSymbol``) if no market exists.
+        """
+        self._ensure_markets_loaded()
+        symbol = self._resolve_symbol(
+            coin_id=coin_id, vs_currency=vs_currency, base_symbol=base_symbol
+        )
+        markets = getattr(self._exchange, "markets", {}) or {}
+        market = markets.get(symbol) or {}
+        base = str(market.get("base") or symbol.split("/")[0])
+        quote_part = symbol.split("/")[1] if "/" in symbol else ""
+        quote = str(market.get("quote") or quote_part)
+        return ResolvedSpotMarket(
+            exchange_id=self._exchange_id,
+            symbol=symbol,
+            base=base,
+            quote=quote,
+        )
 
     def _ensure_markets_loaded(self) -> None:
         if self._markets_loaded:

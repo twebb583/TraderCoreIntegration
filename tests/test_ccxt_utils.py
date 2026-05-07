@@ -62,3 +62,32 @@ def test_multi_exchange_client_falls_back_when_market_missing() -> None:
     assert points[0].price == 456.0
     assert client.snapshot_exchange_usage().get("missing") == 0
     assert client.snapshot_exchange_usage().get("coinbase") == 1
+
+
+def test_resolved_spot_market_dataclass_roundtrip() -> None:
+    from tradercoreintegration.ccxt import ResolvedSpotMarket
+
+    market = ResolvedSpotMarket(exchange_id="binance", symbol="ETH/USDT", base="ETH", quote="USDT")
+    assert market.exchange_id == "binance"
+    assert market.symbol == "ETH/USDT"
+    assert market.base == "ETH"
+    assert market.quote == "USDT"
+
+
+def test_ccxt_client_resolve_spot_market_uses_market_metadata() -> None:
+    from tradercoreintegration.ccxt import CCXTClient
+
+    client = CCXTClient(exchange_id="binance")
+    # Bypass real network by injecting markets and the coin->code lookup.
+    client._exchange.markets = {  # type: ignore[attr-defined]
+        "ETH/USDT": {"base": "ETH", "quote": "USDT"},
+    }
+    client._coin_name_to_code["ethereum"] = "ETH"
+    client._markets_loaded = True
+
+    market = client.resolve_spot_market(coin_id="ethereum", vs_currency="usdt")
+    assert market.symbol == "ETH/USDT"
+    assert market.base == "ETH"
+    assert market.quote == "USDT"
+    assert market.exchange_id == "binance"
+
