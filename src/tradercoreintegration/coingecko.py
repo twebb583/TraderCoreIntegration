@@ -32,7 +32,32 @@ class CoinGeckoClient:
 
     def request_markets(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         url = f"{self._base_url}/coins/markets"
-        return self._request_with_retry(url=url, params=params)
+        data = self._request_with_retry(url=url, params=params)
+        if not isinstance(data, list):
+            raise ValueError("CoinGecko markets response must be a list")
+        return data
+
+    def fetch_coin_detail(self, coin_id: str) -> dict[str, Any]:
+        url = f"{self._base_url}/coins/{coin_id}"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "false",
+            "community_data": "false",
+            "developer_data": "false",
+            "sparkline": "false",
+        }
+        data = self._request_with_retry(url=url, params=params)
+        if not isinstance(data, dict):
+            raise ValueError(f"CoinGecko detail response for {coin_id} must be an object")
+        return data
+
+    def fetch_categories_list(self) -> list[dict[str, Any]]:
+        url = f"{self._base_url}/coins/categories/list"
+        data = self._request_with_retry(url=url, params={})
+        if not isinstance(data, list):
+            raise ValueError("CoinGecko categories list response must be a list")
+        return data
 
     def fetch_top_altcoins_raw(self, vs_currency: str, limit: int = 100) -> list[dict[str, Any]]:
         params = {
@@ -59,7 +84,7 @@ class CoinGeckoClient:
         markets.sort(key=lambda coin: int(coin.get("market_cap_rank") or 10**9))
         return markets[:limit]
 
-    def _request_with_retry(self, *, url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    def _request_with_retry(self, *, url: str, params: dict[str, Any]) -> Any:
         last_exc: Exception | None = None
         last_response: httpx.Response | None = None
 
@@ -84,10 +109,7 @@ class CoinGeckoClient:
                     continue
 
                 response.raise_for_status()
-                data = response.json()
-                if not isinstance(data, list):
-                    raise ValueError("CoinGecko markets response must be a list")
-                return data
+                return response.json()
 
             except httpx.TransportError as exc:
                 last_exc = exc
