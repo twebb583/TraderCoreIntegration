@@ -27,7 +27,7 @@ class CoinGeckoClient:
             # CoinGecko Pro/Demo uses x-cg-demo-api-key or x-cg-pro-api-key.
             # The demo key header works for both demo and free-tier API keys.
             self._headers["x-cg-demo-api-key"] = api_key
-        self._max_retries = max_retries
+        self._max_retries = max(1, max_retries)
         self._backoff_base = backoff_base
 
     def request_markets(self, params: dict[str, Any]) -> list[dict[str, Any]]:
@@ -67,75 +67,46 @@ class CoinGeckoClient:
             "page": 1,
             "sparkline": "false",
         }
-        payload = self.request_markets(params)
-
-        markets: list[dict[str, Any]] = []
-        for item in payload:
-            coin_id = str(item.get("id", ""))
-            if coin_id == "bitcoin":
-                continue
-
-            rank = item.get("market_cap_rank")
-            if rank is None:
-                continue
-
-            markets.append(item)
-
+        markets = [
+            item
+            for item in self.request_markets(params)
+            if str(item.get("id", "")) != "bitcoin" and item.get("market_cap_rank") is not None
+        ]
         markets.sort(key=lambda coin: int(coin.get("market_cap_rank") or 10**9))
         return markets[:limit]
 
     def _request_with_retry(self, *, url: str, params: dict[str, Any]) -> Any:
-        last_exc: Exception | None = None
-        last_response: httpx.Response | None = None
+        last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 1):
             try:
                 with httpx.Client(timeout=self._timeout_seconds) as client:
                     response = client.get(url, params=params, headers=self._headers)
-                last_response = response
-
-                if response.status_code in _RETRYABLE_STATUS_CODES:
-                    if attempt >= self._max_retries:
-                        break
-                    wait = self._backoff_base**attempt
-                    logger.warning(
-                        "CoinGecko returned %d (attempt %d/%d), retrying in %.1fs",
-                        response.status_code,
-                        attempt,
-                        self._max_retries,
-                        wait,
-                    )
-                    time.sleep(wait)
-                    continue
-
-                response.raise_for_status()
-                return response.json()
-
-            except httpx.TransportError as exc:
-                last_exc = exc
-                if attempt >= self._max_retries:
-                    break
-                wait = self._backoff_base**attempt
-                logger.warning(
-                    "CoinGecko transport error (attempt %d/%d): %s, retrying in %.1fs",
-                    attempt,
-                    self._max_retries,
-                    exc,
-                    wait,
+                if response.status_code not in _RETRYABLE_STATUS_CODES:
+                    response.raise_for_status()
+                    return response.json()
+                last_error = httpx.HTTPStatusError(
+                    f"CoinGecko returned retryable status after {self._max_retries} attempts",
+                    request=response.request,
+                    response=response,
                 )
-                time.sleep(wait)
+                failure = f"returned {response.status_code}"
+            except httpx.TransportError as exc:
+                last_error = exc
+                failure = f"transport error: {exc}"
 
-        if last_exc is not None:
-            raise last_exc
-        if last_response is not None:
-            raise httpx.HTTPStatusError(
-                f"CoinGecko returned retryable status after {self._max_retries} attempts",
-                request=last_response.request,
-                response=last_response,
+            if attempt >= self._max_retries:
+                break
+
+            wait = self._backoff_base**attempt
+            logger.warning(
+                "CoinGecko %s (attempt %d/%d), retrying in %.1fs",
+                failure,
+                attempt,
+                self._max_retries,
+                wait,
             )
-        request = httpx.Request("GET", url)
-        raise httpx.HTTPStatusError(
-            f"CoinGecko returned retryable status after {self._max_retries} attempts",
-            request=request,
-            response=httpx.Response(status_code=500, request=request),
-        )
+            time.sleep(wait)
+
+        assert last_error is not None  # loop always runs: max_retries is clamped to >= 1
+        raise last_error

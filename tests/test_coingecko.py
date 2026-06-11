@@ -171,3 +171,12 @@ def test_request_with_retry_reraises_transport_error_after_exhausting_retries(mo
 
     assert len(requests_made) == 2
     assert sleeps == [2.0]
+
+
+def test_max_retries_is_clamped_to_at_least_one_attempt(monkeypatch) -> None:
+    client, requests_made, _ = _patched_client(monkeypatch, [], max_retries=0)
+
+    result = client._request_with_retry(url="https://example.com/ping", params={})
+
+    assert result == {"ok": True}
+    assert len(requests_made) == 1

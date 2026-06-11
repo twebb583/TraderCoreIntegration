@@ -13,3 +13,9 @@ Shared package for external integration infrastructure used by Trader services.
 ```bash
 python -m pip install -e .
 ```
+
+## Tests
+
+```bash
+python -m pytest
+```

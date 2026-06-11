@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 import time
-from typing import Protocol
+from typing import Any, Protocol
 
 import ccxt
 from ccxt.base.errors import (
@@ -28,6 +28,16 @@ _RETRYABLE_CCXT_ERRORS = (
 _EXCHANGE_ID_ALIASES = {
     "gate": "gateio",
 }
+
+_TIMEFRAME_UNIT_MS = {
+    "m": 60_000,
+    "h": 3_600_000,
+    "d": 86_400_000,
+    "w": 604_800_000,
+}
+
+# Quotes tried, in order, when the requested quote has no market on the exchange.
+_FALLBACK_QUOTES = ("USDT", "USD", "USDC", "BUSD")
 
 
 @dataclass
@@ -73,9 +83,8 @@ class CCXTClient:
         enable_rate_limit: bool = True,
         symbol_overrides: dict[str, str] | None = None,
     ) -> None:
-        resolved_exchange_id = resolve_exchange_id(exchange_id)
-        self._exchange_id = resolved_exchange_id
-        exchange_class = getattr(ccxt, resolved_exchange_id, None)
+        self._exchange_id = resolve_exchange_id(exchange_id)
+        exchange_class = getattr(ccxt, self._exchange_id, None)
         if exchange_class is None:
             raise ValueError(f"Unsupported CCXT exchange: {exchange_id}")
 
@@ -111,54 +120,32 @@ class CCXTClient:
     ) -> list[OHLCVPoint]:
         self._ensure_markets_loaded()
 
-        symbol = self._resolve_symbol(coin_id=coin_id, vs_currency=vs_currency, base_symbol=base_symbol)
-        since_ms = int(from_dt.timestamp() * 1000)
+        symbol = self._resolve_symbol(
+            coin_id=coin_id, vs_currency=vs_currency, base_symbol=base_symbol
+        )
+        from_ms = int(from_dt.timestamp() * 1000)
         to_ms = int(to_dt.timestamp() * 1000)
         frame_ms = _timeframe_to_milliseconds(self._ohlcv_timeframe)
 
-        points_by_ts: dict[int, OHLCVPoint] = {}
+        points_by_time: dict[datetime, OHLCVPoint] = {}
+        since_ms = from_ms
 
         while since_ms <= to_ms:
-            _since = since_ms
             candles = self._with_retries(
-                lambda _s=_since: self._exchange.fetch_ohlcv(
+                lambda since=since_ms: self._exchange.fetch_ohlcv(
                     symbol=symbol,
                     timeframe=self._ohlcv_timeframe,
-                    since=_s,
+                    since=since,
                     limit=self._ohlcv_limit,
                 )
             )
-
             if not candles:
                 break
 
-            from_ms = int(from_dt.timestamp() * 1000)
             for row in candles:
-                if len(row) < 5:
-                    continue
-
-                ts_ms = int(row[0])
-                open_price = float(row[1]) if len(row) > 1 and row[1] is not None else None
-                high_price = float(row[2]) if len(row) > 2 and row[2] is not None else None
-                low_price = float(row[3]) if len(row) > 3 and row[3] is not None else None
-                close_price = float(row[4]) if len(row) > 4 and row[4] is not None else 0.0
-                volume = float(row[5]) if len(row) > 5 and row[5] is not None else None
-
-                if close_price <= 0:
-                    continue
-
-                if ts_ms < from_ms or ts_ms > to_ms:
-                    continue
-
-                points_by_ts[ts_ms] = OHLCVPoint(
-                    captured_at=datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
-                    price=close_price,
-                    open=open_price,
-                    high=high_price,
-                    low=low_price,
-                    close=close_price,
-                    volume=volume,
-                )
+                point = _parse_candle(row, from_ms=from_ms, to_ms=to_ms)
+                if point is not None:
+                    points_by_time[point.captured_at] = point
 
             last_ts = int(candles[-1][0])
             if last_ts >= to_ms:
@@ -170,7 +157,7 @@ class CCXTClient:
             since_ms = next_since
 
         self._successful_requests += 1
-        return [points_by_ts[ts] for ts in sorted(points_by_ts)]
+        return [points_by_time[ts] for ts in sorted(points_by_time)]
 
     def reset_exchange_usage(self) -> None:
         self._successful_requests = 0
@@ -194,17 +181,17 @@ class CCXTClient:
         symbol = self._resolve_symbol(
             coin_id=coin_id, vs_currency=vs_currency, base_symbol=base_symbol
         )
-        markets = getattr(self._exchange, "markets", {}) or {}
-        market = markets.get(symbol) or {}
-        base = str(market.get("base") or symbol.split("/")[0])
-        quote_part = symbol.split("/")[1] if "/" in symbol else ""
-        quote = str(market.get("quote") or quote_part)
+        market = self._markets().get(symbol) or {}
+        base_part, _, quote_part = symbol.partition("/")
         return ResolvedSpotMarket(
             exchange_id=self._exchange_id,
             symbol=symbol,
-            base=base,
-            quote=quote,
+            base=str(market.get("base") or base_part),
+            quote=str(market.get("quote") or quote_part),
         )
+
+    def _markets(self) -> dict:
+        return getattr(self._exchange, "markets", {}) or {}
 
     def _ensure_markets_loaded(self) -> None:
         if self._markets_loaded:
@@ -215,67 +202,68 @@ class CCXTClient:
 
         for code, data in currencies.items():
             self._coin_name_to_code[_normalize_key(code)] = code
-
-            if isinstance(data, dict):
-                name = data.get("name")
-                cur_id = data.get("id")
-                if isinstance(name, str) and name.strip():
-                    self._coin_name_to_code[_normalize_key(name)] = code
-                if isinstance(cur_id, str) and cur_id.strip():
-                    self._coin_name_to_code[_normalize_key(cur_id)] = code
+            if not isinstance(data, dict):
+                continue
+            for alias in (data.get("name"), data.get("id")):
+                if isinstance(alias, str) and alias.strip():
+                    self._coin_name_to_code[_normalize_key(alias)] = code
 
         self._markets_loaded = True
 
-    def _resolve_symbol(self, coin_id: str, vs_currency: str, base_symbol: str | None = None) -> str:
+    def _resolve_symbol(
+        self, coin_id: str, vs_currency: str, base_symbol: str | None = None
+    ) -> str:
         if not self._markets_loaded:
             raise RuntimeError("Markets are not loaded")
 
-        normalized_coin_id = _normalize_key(coin_id)
-        override = self._symbol_overrides.get(normalized_coin_id)
-        markets = getattr(self._exchange, "markets", {}) or {}
+        markets = self._markets()
 
+        override = self._symbol_overrides.get(_normalize_key(coin_id))
         if override:
             if override in markets:
                 return override
-            raise CCXTMarketNotFoundError(f"Configured CCXT symbol override not found in markets: {override}")
+            raise CCXTMarketNotFoundError(
+                f"Configured CCXT symbol override not found in markets: {override}"
+            )
 
-        base_code: str | None = None
-        if base_symbol:
-            normalized_symbol = _normalize_key(base_symbol)
-            base_code = self._coin_name_to_code.get(normalized_symbol, normalized_symbol.upper())
-
-        if base_code is None:
-            base_code = self._coin_name_to_code.get(normalized_coin_id)
-
-        if base_code is None:
-            slug_token = coin_id.split("-")[0].strip()
-            base_code = self._coin_name_to_code.get(_normalize_key(slug_token), slug_token.upper())
+        base_code = self._resolve_base_code(coin_id=coin_id, base_symbol=base_symbol)
 
         requested_quote = vs_currency.upper()
         if requested_quote in ("BTC", "ETH"):
             candidate_quotes = [requested_quote]
         else:
-            candidate_quotes = [requested_quote, "USDT", "USD", "USDC", "BUSD"]
+            candidate_quotes = list(dict.fromkeys((requested_quote, *_FALLBACK_QUOTES)))
 
-        seen_quotes: set[str] = set()
         for quote in candidate_quotes:
-            if quote in seen_quotes:
-                continue
-            seen_quotes.add(quote)
-
             symbol = f"{base_code}/{quote}"
             if symbol in markets:
                 return symbol
 
+        quote_set = set(candidate_quotes)
         for symbol, market in markets.items():
-            if not isinstance(market, dict):
-                continue
-            if market.get("base") == base_code and market.get("quote") in seen_quotes:
+            if (
+                isinstance(market, dict)
+                and market.get("base") == base_code
+                and market.get("quote") in quote_set
+            ):
                 return symbol
 
         raise CCXTMarketNotFoundError(
-            f"No CCXT market found for coin_id={coin_id}, resolved base={base_code}, quote={requested_quote}"
+            f"No CCXT market found for coin_id={coin_id}, "
+            f"resolved base={base_code}, quote={requested_quote}"
         )
+
+    def _resolve_base_code(self, coin_id: str, base_symbol: str | None) -> str:
+        if base_symbol:
+            normalized = _normalize_key(base_symbol)
+            return self._coin_name_to_code.get(normalized, normalized.upper())
+
+        base_code = self._coin_name_to_code.get(_normalize_key(coin_id))
+        if base_code is not None:
+            return base_code
+
+        slug_token = coin_id.split("-")[0].strip()
+        return self._coin_name_to_code.get(_normalize_key(slug_token), slug_token.upper())
 
     def _with_retries(self, operation):
         attempts = self._max_retries + 1
@@ -312,10 +300,9 @@ class MultiExchangeCCXTClient:
         if not clients:
             raise ValueError("At least one CCXT client must be provided")
         self._clients = list(clients)
-        self._exchange_usage: dict[str, int] = {}
-        for client in self._clients:
-            exchange_id = getattr(client, "exchange_id", client.__class__.__name__)
-            self._exchange_usage[str(exchange_id)] = 0
+        self._exchange_usage: dict[str, int] = {
+            _client_exchange_id(client): 0 for client in self._clients
+        }
 
     def fetch_ohlcv_range(
         self,
@@ -336,62 +323,45 @@ class MultiExchangeCCXTClient:
                     to_dt=to_dt,
                     base_symbol=base_symbol,
                 )
-                exchange_id = str(getattr(client, "exchange_id", client.__class__.__name__))
-                self._exchange_usage[exchange_id] = self._exchange_usage.get(exchange_id, 0) + 1
-                return points
             except (CCXTMarketNotFoundError, BadSymbol) as exc:
                 last_error = exc
                 continue
+            exchange_id = _client_exchange_id(client)
+            self._exchange_usage[exchange_id] = self._exchange_usage.get(exchange_id, 0) + 1
+            return points
 
-        if last_error is not None:
-            raise last_error
-        return []
+        assert last_error is not None  # __init__ guarantees at least one client
+        raise last_error
 
     def reset_exchange_usage(self) -> None:
-        for exchange_id in list(self._exchange_usage):
-            self._exchange_usage[exchange_id] = 0
+        self._exchange_usage = dict.fromkeys(self._exchange_usage, 0)
         for client in self._clients:
             client.reset_exchange_usage()
 
     def snapshot_exchange_usage(self) -> dict[str, int]:
         usage = dict(self._exchange_usage)
         for client in self._clients:
-            for exchange_id, count in client.snapshot_exchange_usage().items():
-                if exchange_id not in usage:
-                    usage[exchange_id] = 0
-                _ = count
+            for exchange_id in client.snapshot_exchange_usage():
+                usage.setdefault(exchange_id, 0)
         return usage
 
 
 def parse_symbol_overrides(raw: str) -> dict[str, str]:
-    if not raw.strip():
-        return {}
-
     pairs: dict[str, str] = {}
-    for item in raw.split(","):
-        token = item.strip()
+    for token in (item.strip() for item in raw.split(",")):
         if not token:
             continue
-        if ":" not in token:
-            raise ValueError(f"Invalid CCXT symbol override entry: {token}")
-        coin_id, symbol = token.split(":", 1)
+        coin_id, sep, symbol = token.partition(":")
         coin_id = coin_id.strip()
         symbol = symbol.strip()
-        if not coin_id or not symbol:
+        if not sep or not coin_id or not symbol:
             raise ValueError(f"Invalid CCXT symbol override entry: {token}")
         pairs[coin_id] = symbol
-
     return pairs
 
 
 def parse_exchange_ids(raw: str) -> list[str]:
-    if not raw.strip():
-        return []
     return [exchange_id.strip() for exchange_id in raw.split(",") if exchange_id.strip()]
-
-
-def _normalize_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
 def resolve_exchange_id(exchange_id: str) -> str:
@@ -399,17 +369,49 @@ def resolve_exchange_id(exchange_id: str) -> str:
     return _EXCHANGE_ID_ALIASES.get(normalized, normalized)
 
 
-def _timeframe_to_milliseconds(timeframe: str) -> int:
-    if timeframe.endswith("m"):
-        return int(timeframe[:-1]) * 60_000
-    if timeframe.endswith("h"):
-        return int(timeframe[:-1]) * 3_600_000
-    if timeframe.endswith("d"):
-        return int(timeframe[:-1]) * 86_400_000
-    if timeframe.endswith("w"):
-        return int(timeframe[:-1]) * 604_800_000
-    raise ValueError(f"Unsupported CCXT timeframe: {timeframe}")
-
-
 def exponential_backoff_seconds(*, attempt: int, base: float) -> float:
     return base * (2**attempt)
+
+
+def _client_exchange_id(client: object) -> str:
+    return str(getattr(client, "exchange_id", client.__class__.__name__))
+
+
+def _normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _timeframe_to_milliseconds(timeframe: str) -> int:
+    unit_ms = _TIMEFRAME_UNIT_MS.get(timeframe[-1:])
+    if unit_ms is None:
+        raise ValueError(f"Unsupported CCXT timeframe: {timeframe}")
+    return int(timeframe[:-1]) * unit_ms
+
+
+def _parse_candle(row: Any, *, from_ms: int, to_ms: int) -> OHLCVPoint | None:
+    """Convert one CCXT candle row to an OHLCVPoint.
+
+    Returns None for rows that are malformed, have a non-positive close, or
+    fall outside the requested time range.
+    """
+    if len(row) < 5 or row[0] is None or row[4] is None:
+        return None
+
+    ts_ms = int(row[0])
+    close_price = float(row[4])
+    if close_price <= 0 or not from_ms <= ts_ms <= to_ms:
+        return None
+
+    return OHLCVPoint(
+        captured_at=datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+        price=close_price,
+        open=_optional_float(row[1]),
+        high=_optional_float(row[2]),
+        low=_optional_float(row[3]),
+        close=close_price,
+        volume=_optional_float(row[5]) if len(row) > 5 else None,
+    )
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)

@@ -1,8 +1,10 @@
 from .ccxt import (
     CCXTClient,
     CCXTMarketNotFoundError,
+    ExchangePriceClient,
     MultiExchangeCCXTClient,
     OHLCVPoint,
+    ResolvedSpotMarket,
     exponential_backoff_seconds,
     parse_exchange_ids,
     parse_symbol_overrides,
@@ -13,9 +15,11 @@ from .coingecko import CoinGeckoClient
 __all__ = [
     "CCXTClient",
     "CCXTMarketNotFoundError",
+    "CoinGeckoClient",
+    "ExchangePriceClient",
     "MultiExchangeCCXTClient",
     "OHLCVPoint",
-    "CoinGeckoClient",
+    "ResolvedSpotMarket",
     "exponential_backoff_seconds",
     "parse_exchange_ids",
     "parse_symbol_overrides",
