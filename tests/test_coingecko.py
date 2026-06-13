@@ -111,7 +111,13 @@ def _patched_client(monkeypatch, responses, **kwargs):
             item = queue.pop(0) if queue else 200
             if isinstance(item, Exception):
                 raise item
-            return httpx.Response(item, json={"ok": True}, request=httpx.Request("GET", url))
+            status, response_headers = item if isinstance(item, tuple) else (item, {})
+            return httpx.Response(
+                status,
+                json={"ok": True},
+                headers=response_headers,
+                request=httpx.Request("GET", url),
+            )
 
     monkeypatch.setattr(httpx, "Client", FakeHTTPClient)
     monkeypatch.setattr(time, "sleep", sleeps.append)
@@ -127,6 +133,20 @@ def test_request_with_retry_retries_retryable_statuses_until_success(monkeypatch
     assert result == {"ok": True}
     assert len(requests_made) == 3
     assert sleeps == [2.0, 4.0]
+
+
+def test_request_with_retry_honors_retry_after_header(monkeypatch) -> None:
+    client, requests_made, sleeps = _patched_client(
+        monkeypatch,
+        [(429, {"Retry-After": "9"})],
+        max_retries=2,
+    )
+
+    result = client._request_with_retry(url="https://example.com/ping", params={})
+
+    assert result == {"ok": True}
+    assert len(requests_made) == 2
+    assert sleeps == [9.0]
 
 
 def test_request_with_retry_raises_status_error_after_exhausting_retries(monkeypatch) -> None:

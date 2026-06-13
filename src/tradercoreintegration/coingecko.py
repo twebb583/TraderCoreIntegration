@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -9,6 +11,28 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    raw_value = response.headers.get("retry-after")
+    if not raw_value:
+        return None
+
+    value = raw_value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+
+    if seconds <= 0:
+        return None
+    return seconds
 
 
 class CoinGeckoClient:
@@ -98,7 +122,11 @@ class CoinGeckoClient:
             if attempt >= self._max_retries:
                 break
 
-            wait = self._backoff_base**attempt
+            wait = (
+                _retry_after_seconds(last_error.response)
+                if isinstance(last_error, httpx.HTTPStatusError)
+                else None
+            ) or self._backoff_base**attempt
             logger.warning(
                 "CoinGecko %s (attempt %d/%d), retrying in %.1fs",
                 failure,
