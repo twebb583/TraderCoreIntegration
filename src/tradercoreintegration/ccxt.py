@@ -103,6 +103,7 @@ class CCXTClient:
         }
 
         self._markets_loaded = False
+        self._market_load_error: CCXTMarketNotFoundError | None = None
         self._coin_name_to_code: dict[str, str] = {}
         self._successful_requests = 0
 
@@ -194,10 +195,20 @@ class CCXTClient:
         return getattr(self._exchange, "markets", {}) or {}
 
     def _ensure_markets_loaded(self) -> None:
+        if self._market_load_error is not None:
+            raise self._market_load_error
         if self._markets_loaded:
             return
 
-        self._with_retries(self._exchange.load_markets)
+        try:
+            self._with_retries(self._exchange.load_markets)
+        except TypeError as exc:
+            if not _is_ccxt_market_id_sort_error(exc):
+                raise
+            self._market_load_error = CCXTMarketNotFoundError(
+                f"CCXT market metadata for exchange={self._exchange_id} could not be loaded"
+            )
+            raise self._market_load_error from exc
         currencies = getattr(self._exchange, "currencies", {}) or {}
 
         for code, data in currencies.items():
@@ -371,6 +382,11 @@ def resolve_exchange_id(exchange_id: str) -> str:
 
 def exponential_backoff_seconds(*, attempt: int, base: float) -> float:
     return base * (2**attempt)
+
+
+def _is_ccxt_market_id_sort_error(exc: TypeError) -> bool:
+    message = str(exc)
+    return "'<' not supported" in message and "str" in message and "NoneType" in message
 
 
 def _client_exchange_id(client: object) -> str:

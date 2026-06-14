@@ -284,6 +284,30 @@ def test_fetch_ohlcv_range_pages_dedupes_and_filters_rows() -> None:
     assert client.snapshot_exchange_usage() == {"binance": 1}
 
 
+def test_market_load_sort_type_error_is_treated_as_missing_market() -> None:
+    client = CCXTClient(exchange_id="binance")
+
+    class BrokenExchange:
+        currencies = {}
+
+        def __init__(self) -> None:
+            self.load_calls = 0
+
+        def load_markets(self):
+            self.load_calls += 1
+            raise TypeError("'<' not supported between instances of 'str' and 'NoneType'")
+
+    exchange = BrokenExchange()
+    client._exchange = exchange  # type: ignore[assignment]
+
+    with pytest.raises(CCXTMarketNotFoundError):
+        client.resolve_spot_market(coin_id="ethereum", vs_currency="usdt")
+    with pytest.raises(CCXTMarketNotFoundError):
+        client.resolve_spot_market(coin_id="solana", vs_currency="usdt")
+
+    assert exchange.load_calls == 1
+
+
 def test_with_retries_retries_retryable_errors_until_success(monkeypatch) -> None:
     sleeps: list[float] = []
     monkeypatch.setattr(time, "sleep", sleeps.append)
